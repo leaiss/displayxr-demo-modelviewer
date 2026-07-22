@@ -55,6 +55,7 @@
 #include "projection_depth.h"
 #include "model_renderer.h"
 #include "model_loader.h"
+#include "eye_pose_hud.h"
 
 // ============================================================================
 // Logging
@@ -613,6 +614,14 @@ int main() {
                               queueFamilyIndex, xr.swapchain.width, xr.swapchain.height))
         LOG_WARN("model renderer init failed");
 
+    // Debug eye-pose overlay (#778): on-panel readout of the located per-eye pose.
+    EyePoseHud g_hud;
+    bool hudOn = (getenv("MV_NO_EYEPOSE_HUD") == nullptr);
+    if (hudOn && !g_hud.init(physDevice, vkDevice, graphicsQueue, queueFamilyIndex)) {
+        LOG_WARN("eye-pose HUD init failed (continuing without it)");
+        hudOn = false;
+    }
+
     if (xr.displayPixelWidth > 0) g_windowW = xr.displayPixelWidth;
     if (xr.displayPixelHeight > 0) g_windowH = xr.displayPixelHeight;
     xr.currentRenderingMode = xr.renderingModeCount > 1 ? 1 : 0;
@@ -641,6 +650,7 @@ int main() {
 
         std::vector<XrCompositionLayerProjectionView> projectionViews;
         bool rendered = false;
+        std::vector<std::string> g_hudLines;   // #778 eye-pose readout for this frame
 
         if (frameState.shouldRender) {
             XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -669,12 +679,41 @@ int main() {
             XrView views[8] = {};
             for (uint32_t v = 0; v < runtimeViewCount; v++) views[v].type = XR_TYPE_VIEW;
             XrViewState viewState = {XR_TYPE_VIEW_STATE};
+            // #778 eye-pose HUD: ask the runtime for the RAW predicted eye
+            // positions it feeds the rig — the same eye_pos the 3D-GATE log prints
+            // (David's "pinned at (0,0.1,0.6)" value). Chained on viewState; the
+            // runtime fills it in xrLocateViews (OXR_GET_OUTPUT_FROM_CHAIN).
+            XrViewDisplayRawDXR viewRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+            if (hudOn) viewState.next = &viewRaw;
 
             XrResult lr = xrLocateViews(xr.session, &locateInfo, &viewState,
                                         runtimeViewCount, &runtimeViewCount, views);
             if (XR_SUCCEEDED(lr) &&
                 (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                 (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+
+                // #778 eye-pose HUD: capture the RAW located per-eye pose here,
+                // before the rig path below rewrites views[].pose. This is exactly
+                // what the runtime returns from xrLocateViews — the value David
+                // says "is not changing" on head-move.
+                if (hudOn) {
+                    const XrVector3f zero{0, 0, 0};
+                    const XrVector3f& L = viewRaw.eyeCountOutput > 0 ? viewRaw.rawEyes[0] : zero;
+                    const XrVector3f& R = viewRaw.eyeCountOutput > 1 ? viewRaw.rawEyes[1]
+                                        : (viewRaw.eyeCountOutput > 0 ? viewRaw.rawEyes[0] : zero);
+                    static bool havePrev = false;
+                    static XrVector3f prevL{0, 0, 0};
+                    float dx = L.x - prevL.x, dy = L.y - prevL.y, dz = L.z - prevL.z;
+                    float delta = havePrev ? std::sqrt(dx * dx + dy * dy + dz * dz) : 0.0f;
+                    prevL = L; havePrev = true;
+                    char b[96];
+                    g_hudLines.clear();
+                    g_hudLines.emplace_back("EYE POSE RAW DXR");
+                    std::snprintf(b, sizeof b, "L X:%+.3f Y:%+.3f Z:%+.3f", L.x, L.y, L.z); g_hudLines.emplace_back(b);
+                    std::snprintf(b, sizeof b, "R X:%+.3f Y:%+.3f Z:%+.3f", R.x, R.y, R.z); g_hudLines.emplace_back(b);
+                    std::snprintf(b, sizeof b, "TRACKING:%d EYES:%d", (int)viewRaw.isTracking, (int)viewRaw.eyeCountOutput); g_hudLines.emplace_back(b);
+                    std::snprintf(b, sizeof b, "DELTA:%.4f %s", delta, delta > 1e-4f ? "MOVING" : "STATIC"); g_hudLines.emplace_back(b);
+                }
 
                 uint32_t m = xr.currentRenderingMode;
                 uint32_t modeViewCount = (xr.renderingModeCount > 0 && m < xr.renderingModeCount)
@@ -767,6 +806,10 @@ int main() {
                                 xr.swapchain.width, xr.swapchain.height,
                                 tileOffsets[eye].first, tileOffsets[eye].second,
                                 renderW, renderH, viewMat[eye].data(), projMat[eye].data());
+                        // #778: overlay the eye-pose readout into each eye tile
+                        // (after the model, before release — image is COLOR_ATTACHMENT).
+                        if (hudOn && !g_hudLines.empty())
+                            g_hud.render(targetImage, tileOffsets, g_hudLines);
                     }
                     ReleaseSwapchainImage(xr);
                 }
@@ -785,6 +828,7 @@ int main() {
         }
     }
 
+    if (hudOn) g_hud.destroy();
     g_modelRenderer.cleanup();
     if (vkDevice) vkDeviceWaitIdle(vkDevice);
     CleanupOpenXR(xr);

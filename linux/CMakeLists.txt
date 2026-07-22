@@ -54,6 +54,8 @@ add_executable(model_viewer_handle_vk_linux
     # The single stb_image implementation TU (displayxr::common only ships it
     # for Win/macOS; the model_common loaders take declarations only).
     stb_image_impl_linux.cpp
+    # #778 debug: on-panel eye-pose readout (self-contained, no font deps).
+    eye_pose_hud.cpp
 )
 
 target_include_directories(model_viewer_handle_vk_linux PRIVATE
