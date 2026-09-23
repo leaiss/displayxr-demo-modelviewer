@@ -24,6 +24,39 @@ endif()
 find_package(Vulkan REQUIRED)
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 
+# Native-Wayland windowing: libwayland-client for the app-owned surface, plus
+# wayland-scanner + wayland-protocols to generate the xdg-shell client stubs at
+# build time (reproducible; no checked-in generated files). See linux/main.cpp
+# XR_DXR_wayland_surface_binding path.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(WAYLAND REQUIRED wayland-client)
+pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
+find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
+message(STATUS "Wayland: ${WAYLAND_VERSION}; protocols in ${WAYLAND_PROTOCOLS_DIR}; scanner ${WAYLAND_SCANNER}")
+set(XDG_SHELL_XML "${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml")
+set(XDG_SHELL_HEADER "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h")
+set(XDG_SHELL_CODE   "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c")
+add_custom_command(OUTPUT "${XDG_SHELL_HEADER}"
+    COMMAND ${WAYLAND_SCANNER} client-header "${XDG_SHELL_XML}" "${XDG_SHELL_HEADER}"
+    DEPENDS "${XDG_SHELL_XML}" VERBATIM)
+add_custom_command(OUTPUT "${XDG_SHELL_CODE}"
+    COMMAND ${WAYLAND_SCANNER} private-code "${XDG_SHELL_XML}" "${XDG_SHELL_CODE}"
+    DEPENDS "${XDG_SHELL_XML}" VERBATIM)
+
+# xdg-decoration (unstable v1): lets the app ask Mutter to draw a server-side
+# window title bar around the native-Wayland surface. Without it the toplevel is
+# borderless. The runtime accommodates the title-bar frame offset (#1654) so the
+# weave stays aligned to the content surface.
+set(XDG_DECOR_XML "${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml")
+set(XDG_DECOR_HEADER "${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-unstable-v1-client-protocol.h")
+set(XDG_DECOR_CODE   "${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-unstable-v1-protocol.c")
+add_custom_command(OUTPUT "${XDG_DECOR_HEADER}"
+    COMMAND ${WAYLAND_SCANNER} client-header "${XDG_DECOR_XML}" "${XDG_DECOR_HEADER}"
+    DEPENDS "${XDG_DECOR_XML}" VERBATIM)
+add_custom_command(OUTPUT "${XDG_DECOR_CODE}"
+    COMMAND ${WAYLAND_SCANNER} private-code "${XDG_DECOR_XML}" "${XDG_DECOR_CODE}"
+    DEPENDS "${XDG_DECOR_XML}" VERBATIM)
+
 # OpenXR loader — CONFIG package first (a dev/CI loader built to
 # CMAKE_PREFIX_PATH, e.g. /tmp/openxr-install), else a plain find_library.
 set(OPENXR_FOUND FALSE)
@@ -56,12 +89,21 @@ add_executable(model_viewer_handle_vk_linux
     stb_image_impl_linux.cpp
     # #778 debug: on-panel eye-pose readout (self-contained, no font deps).
     eye_pose_hud.cpp
+    # Generated xdg-shell client protocol (native-Wayland surface).
+    "${XDG_SHELL_CODE}"
+    "${XDG_SHELL_HEADER}"
+    # Generated xdg-decoration client protocol (server-side title bar).
+    "${XDG_DECOR_CODE}"
+    "${XDG_DECOR_HEADER}"
 )
 
 target_include_directories(model_viewer_handle_vk_linux PRIVATE
     ${CMAKE_SOURCE_DIR}/openxr_includes
     ${CMAKE_SOURCE_DIR}/common
     ${CMAKE_SOURCE_DIR}/model_common
+    ${CMAKE_CURRENT_BINARY_DIR}   # generated xdg-shell-client-protocol.h
+    ${WAYLAND_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libdecor-0  # vendored libdecor.h (no -dev pkg on box)
 )
 
 target_link_libraries(model_viewer_handle_vk_linux PRIVATE
@@ -69,6 +111,10 @@ target_link_libraries(model_viewer_handle_vk_linux PRIVATE
     model_renderer
     OpenXR::openxr_loader
     Vulkan::Vulkan
+    ${WAYLAND_LIBRARIES}
+    # libdecor runtime lib is installed (libdecor-0.so.0 + GTK plugin); link the
+    # versioned SONAME directly since the -dev symlink isn't installed on this box.
+    /lib/x86_64-linux-gnu/libdecor-0.so.0
 )
 
 # Copy the OpenXR loader .so next to the exe when it's an imported target, so a
